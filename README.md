@@ -1,48 +1,77 @@
 # mastra-provider-tool-bail-repro
 
-Minimal reproduction for a bug in `@mastra/core` where **provider-executed tools** (e.g. Anthropic's `web_search_20250305`) cause the agent stream to bail when called in parallel with regular tools.
+Minimal reproduction for two bugs in `@mastra/core` when **provider-executed tools** (e.g. Anthropic's `web_search_20250305`) are called in parallel with regular tools.
 
-## The Bug
+## The Bugs
 
-When an Anthropic server-executed tool (`providerExecuted: true`) runs alongside a `createTool` in the same step, the stream terminates after 1 step with **zero tool results**. All successful tool results — including those from other tools that completed normally — are dropped.
+### Bug 1: Stream bail
 
-## Root Cause
+When a provider-executed tool runs alongside a `createTool` in the same step, the agentic loop terminates after one step with zero tool results.
 
-1. `transform.ts` drops the `output` field when converting AI SDK `tool-call` chunks to Mastra's internal format
-2. `toolCallStep` returns `result: inputData.output` which is `undefined` for the provider-executed tool
-3. `llmExecutionMappingStep` sees `hasUndefinedResult = true` and calls `bail()`, terminating the entire stream
+**Root cause:** `toolCallStep` returns `result: inputData.output` which is `undefined` for provider-executed tools (the `output` field is not carried through the transform). `llmExecutionMappingStep` sees `hasUndefinedResult = true` and calls `bail()`, terminating the entire stream.
+
+**Symptom:** Two `tool-call` chunks, zero `tool-result` chunks. Process exits immediately.
+
+### Bug 2: Web search results not delivered
+
+Even after the bail fix, the model re-calls `web_search` in step 2 because the deferred search results are lost.
+
+**Root cause:** The `sanitizeMessages` filter strips `server_tool_use` content blocks from assistant messages. When the Anthropic API defers a web search (parallel call), it returns a `server_tool_use` block that represents the deferred execution. Stripping this block means the continuation request is missing context, so the model thinks the search never happened and retries it.
+
+**Symptom:** `web_search` appears in step 2 tool-calls even though it was already called in step 1.
 
 ## Reproduce
 
 ```bash
-# Requires Node 20+, pnpm
 git clone https://github.com/kaikloepfer/mastra-provider-tool-bail-repro.git
 cd mastra-provider-tool-bail-repro
-pnpm install
-ANTHROPIC_API_KEY=sk-ant-... npx tsx src/index.ts
+npm install   # or pnpm install
+
+# Set your API key
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Run the reproduction
+npx tsx src/index.ts
 ```
 
-### Expected
-
-Stream completes with `tool-result` chunks for both tools, then an assistant text response.
-
-### Actual
+### Expected (after both fixes)
 
 ```
-chunk types: {
-  start: 1,
-  'step-start': 1,
-  'tool-call-input-streaming-start': 2,
-  'tool-call-delta': 4,
-  'tool-call-input-streaming-end': 2,
-  'tool-call': 2,
-  'step-finish': 1,
-  finish: 1
-}
-FAIL — 0 tool results (stream bailed)
+Step 1:
+  tool-calls:   [web_search_20250305, get_company_info]
+  tool-result:  get_company_info (providerExecuted=undefined): ...
+  tool-result:  web_search_20250305 (providerExecuted=true): ...
+
+Step 2:
+  (text generation only)
+
+PASS [Bug 1] Stream completed: 2 tool-result chunk(s)
+PASS [Bug 2] web_search not re-called (deferred search results preserved)
 ```
 
-Two `tool-call` chunks (model called both tools), zero `tool-result` chunks. Process exits with code 1.
+### Actual (before fixes)
+
+Bug 1 manifests as:
+```
+Step 1:
+  tool-calls:   [web_search_20250305, get_company_info]
+  (no tool-results — stream bailed)
+
+FAIL [Bug 1] Stream bailed: 0 tool-result chunks received
+```
+
+Bug 2 manifests as (with bail fix applied, but not sanitization fix):
+```
+Step 1:
+  tool-calls:   [web_search_20250305, get_company_info]
+  tool-result:  ...
+
+Step 2:
+  tool-calls:   [web_search_20250305]   <-- model retries search
+  tool-result:  ...
+
+FAIL [Bug 2] web_search re-called in step(s) 2
+```
 
 ## Versions
 
